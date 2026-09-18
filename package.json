@@ -1,15 +1,15 @@
 {
-  "name": "backend",
+  "name": "csit-vault-chatbot-backend",
   "version": "1.0.0",
-  "description": "",
-  "license": "ISC",
-  "author": "",
+  "description": "Backend API for The CSIT Vault Chatbot powered by Google Gemini",
+  "license": "MIT",
+  "author": "Nishan Dhakal",
   "type": "commonjs",
-  "main": "index.js",
+  "main": "app.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
     "start": "node app.js",
-    "dev": "nodemon app.js"
+    "dev": "nodemon app.js",
+    "build": "echo \"Build not required for Node backend\""
   },
   "dependencies": {
     "axios": "^1.11.0",
