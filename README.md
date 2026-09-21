@@ -1,131 +1,106 @@
-# The CSIT Vault Chatbot Backend
+# The CSIT Vault Chatbot
 
-A Node.js & Express backend API for **The CSIT Vault Chatbot**, powered by Google Gemini AI. Built to assist BSc. CSIT (Computer Science & Information Technology) students with curriculum questions, programming, lab reports, past exam questions, and academic guidance.
+Node.js/Express API for The CSIT Vault study assistant, powered by Gemini. Use Node.js 20 or newer.
 
----
+## Run locally
 
-## Features
-
-- **Google Gemini Integration**: Fast and reliable AI responses using `gemini-1.5-flash` or `gemini-2.0-flash`.
-- **CSIT Vault Persona**: System instructions tuned specifically for BSc. CSIT students and computer science subjects.
-- **Conversation Context**: Supports multi-turn dialogue history.
-- **Resilient Fallback**: Automatic model fallback and 30-second request timeouts.
-- **Helpful Error Reporting**: Detects revoked/leaked keys, quota limits, and gives clear diagnostic feedback.
-- **CORS Enabled**: Ready to connect with the frontend widget.
-
----
-
-## Setup Instructions
-
-### 1. Install Dependencies
-```bash
+```powershell
 npm install
-```
-
-### 2. Configure Environment Variables
-Create a `.env` file in the project root (you can copy `.env.example`):
-
-```bash
-cp .env.example .env
-```
-
-Set your values in `.env`:
-```env
-GEMINI_API_KEY=your_actual_gemini_api_key_here
-GEMINI_MODEL=gemini-1.5-flash
-PORT=5000
-```
-
-> [!IMPORTANT]
-> **Getting a Free Gemini API Key:**
-> 1. Go to [Google AI Studio](https://aistudio.google.com/app/apikey).
-> 2. Sign in with your Google account.
-> 3. Click **"Create API key"**.
-> 4. Copy the key and paste it as `GEMINI_API_KEY` in `.env`.
-> 5. **Never commit `.env` to Git!** Keep it in `.gitignore`.
-
-### 3. Run the Server
-
-**Development Mode (with auto-reload):**
-```bash
-npm run dev
-```
-
-**Production Mode:**
-```bash
+# Only if .env does not already exist:
+Copy-Item .env.example .env
+npm run check:gemini
 npm start
 ```
 
----
+Set GEMINI_API_KEY in the backend .env file before running the connection check. Keep the existing key if the check succeeds. The sample model is gemini-3.6-flash; GEMINI_MODEL can select another model supported by your project.
 
-## API Endpoints
+When the sibling ChatBot-Frontend folder is present, open http://localhost:5000 for the complete UI. If only the backend repository is deployed, / returns service information; host the frontend repository separately.
 
-### 1. API Status
-- **GET** `/`
-- Returns service status and documentation links.
+## Fixing the leaked/revoked key message
 
-### 2. Health Check
-- **GET** `/health`
-- Returns server status, model configured, and whether `GEMINI_API_KEY` is present.
+A key blocked by Google cannot be repaired in code. If **npm run check:gemini** reports API_KEY_REVOKED:
 
-### 3. Ask Chatbot
-- **POST** `/api/chatbot/ask`
-- **Headers:** `Content-Type: application/json`
-- **Body:**
-  ```json
-  {
-    "prompt": "Explain Binary Search Trees in C++",
-    "history": [
-      { "role": "user", "text": "Hi" },
-      { "role": "model", "text": "Hello! How can I help you with your CSIT studies?" }
-    ]
-  }
-  ```
-- **Response (200 OK):**
-  ```json
-  {
-    "success": true,
-    "reply": "A Binary Search Tree (BST) is a node-based binary tree data structure...",
-    "timestamp": "2026-09-18T11:40:00.000Z"
-  }
-  ```
+1. Create a replacement in [Google AI Studio](https://aistudio.google.com/app/apikey).
+2. Set GEMINI_API_KEY in the backend .env for local development.
+3. For the deployed service, update **Render → your service → Environment → GEMINI_API_KEY** as well.
+4. Restart the backend or redeploy Render. The running process loads configuration at startup.
+5. Run npm run check:gemini again, then test a question.
 
----
+Changing a laptop .env does not update Render. Hosting environment variables take precedence over .env. If the local check succeeds but an old process or the deployed app still reports a revoked key, restart/update that environment rather than repeatedly changing models.
 
-## Testing the API
+Never put a Gemini key in HTML, browser JavaScript, Blogger gadgets, screenshots, or source control. .env and logs are ignored by Git. The API sends the key to Google in an HTTP header, not in the URL. No raw provider errors or student prompts are logged by the new chatbot code.
 
-### Using cURL:
-```bash
-curl -X POST http://localhost:5000/api/chatbot/ask \
-  -H "Content-Type: application/json" \
-  -d '{"prompt": "What subjects are in BSc. CSIT 1st semester?"}'
+Reference: [Google's blocked-key troubleshooting](https://ai.google.dev/gemini-api/docs/troubleshooting#blocked-or-non-working-api-keys).
+
+## Render deployment
+
+- Deploy the backend repository.
+- Build command: npm ci
+- Start command: npm start
+- Environment: GEMINI_API_KEY and optionally GEMINI_MODEL.
+- Let Render supply PORT.
+- Restart/redeploy after changing environment variables.
+- Deploy frontend changes separately; its default public API URL is https://the-csit-vault-chatbot.onrender.com.
+
+The backend has no compilation step. The previous recursive build script was removed.
+
+## API
+
+### GET /health
+
+Reports server liveness and locally known AI state. It makes no paid Gemini request and never returns the key.
+
+```json
+{
+  "status": "OK",
+  "message": "Server is running",
+  "apiKeyConfigured": true,
+  "aiStatus": "not_checked",
+  "timestamp": "..."
+}
 ```
 
-### Using PowerShell:
+aiStatus is not_configured, not_checked, ready, degraded or unavailable. A configured key is not proof that it works; ready means a prior Gemini request succeeded in this process.
+
+### POST /api/chatbot/ask
+
+```json
+{
+  "prompt": "Explain binary search",
+  "history": [
+    { "role": "user", "text": "I am learning algorithms." },
+    { "role": "model", "text": "What would you like to explore?" }
+  ]
+}
+```
+
+prompt must contain 1–4,000 characters. Optional history contains at most 10 alternating user/model messages (five completed exchanges), each at most 30,000 characters. Success returns { "success": true, "reply": "..." }.
+
+Failures return { "success": false, "code": "...", "error": "visitor-safe message", "retryable": false }:
+
+| Status | Examples |
+| --- | --- |
+| 400 | Invalid question, JSON or history |
+| 413 | Request body exceeds 384 KB |
+| 422 | Gemini blocked the answer |
+| 429 | Gemini quota/rate limit; includes Retry-After |
+| 502 | Empty response or rejected provider request |
+| 503 | Missing/rejected key, unavailable model or provider |
+| 504 | Gemini request timed out |
+
+Rejected credentials are remembered in this server process so repeated questions do not repeatedly call Google with the same bad key. Restart after fixing credentials or permission settings. There are no automatic retries or surprise model substitutions. Transient failures can be retried explicitly; they do not block future requests.
+
+## Checks
+
 ```powershell
-Invoke-RestMethod -Uri "http://localhost:5000/api/chatbot/ask" -Method Post -ContentType "application/json" -Body '{"prompt": "Hello!"}'
+npm test
+npm run check:gemini
 ```
 
----
+The test suite uses mocked Gemini responses and local HTTP requests, with no API usage. The connection check makes one small real Gemini request and prints a safe result without the credential.
 
-## Project Structure
+## Blogger
 
-```
-The-CSIT-VAULT-ChatBot/
-├── .env.example              # Safe environment variable template
-├── .gitignore                # Prevents secrets and dependencies from leaking
-├── app.js                    # Express server initialization & routes
-├── controllers/
-│   └── chatbotController.js  # Request validation and controller logic
-├── routes/
-│   └── chatbotRoutes.js      # Express router for /api/chatbot
-├── services/
-│   └── geminiService.js      # Gemini API caller with system prompt and fallback
-└── package.json              # Project scripts and dependencies
-```
+The frontend includes an isolated floating widget (embed.js), compact iframe layout (?embed=1), and step-by-step installation instructions in the frontend README. Deploy the frontend over HTTPS before adding it to Blogger.
 
----
-
-## Author
-
-Created for **The CSIT Vault** by [Nishan Dhakal](https://www.dhakalnishan.com.np/).
+Created for The CSIT Vault by Nishan Dhakal.

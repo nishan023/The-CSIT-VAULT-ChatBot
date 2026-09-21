@@ -1,145 +1,130 @@
-const axios = require('axios');
-const dotenv = require('dotenv');
-dotenv.config();
+const { GoogleGenAI } = require('@google/genai');
+const { createHash } = require('node:crypto');
+const { getGeminiConfig } = require('../config');
+const { logger } = require('../utils/logger');
 
-const DEFAULT_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
-const CANDIDATE_MODELS = [
-  DEFAULT_MODEL,
-  'gemini-2.5-flash',
-  'gemini-2.0-flash',
-  'gemini-1.5-flash'
-];
-// Remove duplicates while preserving order
-const MODEL_LIST = [...new Set(CANDIDATE_MODELS)];
+const SYSTEM_INSTRUCTION = `You are The CSIT Vault AI Assistant, an educational guide for The CSIT Vault, created by Nishan Dhakal. Help BSc. CSIT students with TU curriculum topics, programming, algorithms, databases, networks, lab work and exam preparation.
+Explain concepts clearly, use short sections and examples, and format code in fenced Markdown blocks with a language. Ask for the semester or syllabus version when needed. Do not invent official syllabus details, past questions, links or platform resources. You do not have access to a live library of platform documents. Encourage understanding and be honest about uncertainty.`;
 
-const CSIT_SYSTEM_INSTRUCTION = `You are "The CSIT Vault AI Assistant", an educational and technical AI guide built for "The CSIT Vault" platform (created by Nishan Dhakal).
-Your primary role is to assist students pursuing BSc. CSIT (Bachelor of Science in Computer Science and Information Technology) and computer science learners.
-You help students with:
-- BSc. CSIT curriculum subjects (TU / Tribhuvan University and general CS courses)
-- Programming languages (C, C++, Java, Python, JavaScript, Web Tech)
-- Core CS topics: Data Structures & Algorithms (DSA), Operating Systems, DBMS, Computer Networks, AI, Theory of Computation, Computer Graphics, Software Engineering, etc.
-- Practical lab assignments, code solutions, debugging, and project ideas
-- Exam preparation, syllabus breakdown, and concept explanations
+class ChatServiceError extends Error {
+  constructor(code, status, message, retryable = false) {
+    super(message);
+    this.code = code;
+    this.status = status;
+    this.retryable = retryable;
+  }
+}
 
-Guidelines:
-- Give clear, structured, and easy-to-understand explanations.
-- Use Markdown formatting (headings, bullet points, bold text, code blocks with language tags) to make responses readable.
-- Be polite, encouraging, and academically helpful.
-- If asked about yourself or the platform, mention that you are the official AI Assistant for The CSIT Vault, dedicated to helping CSIT students succeed.`;
+function configured(key) {
+  return Boolean(key) && !/your_|placeholder|replace_me/i.test(key);
+}
 
-/**
- * Call Gemini API with automatic model fallback and clear error reporting.
- * @param {string} prompt - The user prompt
- * @param {Array} history - Optional previous messages [{ role: 'user'|'model', text: string }]
- * @returns {Promise<string>} - The AI response text
- */
-const getGeminiResponse = async (prompt, history = []) => {
-  const apiKey = process.env.GEMINI_API_KEY;
+function classifyError(error) {
+  const status = error.status || error.response?.status;
+  const message = String(error.message || error.response?.data?.error?.message || '');
 
-  if (!apiKey || apiKey.trim() === '' || apiKey.includes('your_actual') || apiKey.includes('your_gemini')) {
-    throw new Error(
-      'Gemini API key is not configured. Please set a valid GEMINI_API_KEY in your .env file. Get one free at: https://aistudio.google.com/app/apikey'
-    );
+  if (/leaked|revoked/i.test(message)) {
+    return new ChatServiceError('API_KEY_REVOKED', 503, 'The study assistant is temporarily unavailable. The site owner needs to update its AI connection.');
+  }
+  if (status === 401 || status === 403 || /API.?key|API_KEY_INVALID/i.test(message)) {
+    return new ChatServiceError('API_KEY_INVALID', 503, 'The study assistant is temporarily unavailable. The site owner needs to check its AI connection.');
+  }
+  if (status === 429) {
+    return new ChatServiceError('RATE_LIMITED', 429, 'The assistant has reached its usage limit. Please try again later.', true);
+  }
+  if (status === 404 || /not found|no longer available/i.test(message)) {
+    return new ChatServiceError('MODEL_UNAVAILABLE', 503, 'The study assistant needs a model configuration update. Please try again later.');
+  }
+  if (error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT') {
+    return new ChatServiceError('AI_TIMEOUT', 504, 'The assistant took too long to respond. Please try again.', true);
+  }
+  if (status === 503 || /high demand|unavailable/i.test(message)) {
+    return new ChatServiceError('AI_BUSY', 503, 'The AI model is experiencing high demand. Please try again in a moment.', true);
+  }
+  return new ChatServiceError('AI_REQUEST_FAILED', 502, 'The assistant could not process this question. Please rephrase it and try again.');
+}
+
+function createGeminiService({ getConfig = getGeminiConfig, log = logger } = {}) {
+  let fingerprint;
+  let blockedError;
+  let state = 'not_checked';
+  let aiClient = null;
+
+  function readConfig() {
+    const config = getConfig();
+    const nextFingerprint = createHash('sha256').update(`${config.apiKey}:${config.model}`).digest('hex');
+    if (nextFingerprint !== fingerprint) {
+      fingerprint = nextFingerprint;
+      blockedError = null;
+      state = 'not_checked';
+      aiClient = configured(config.apiKey) ? new GoogleGenAI({ apiKey: config.apiKey }) : null;
+    }
+    return config;
   }
 
-  // Build conversation contents
-  const contents = [];
-
-  // Add historical context if provided (up to last 10 messages)
-  if (Array.isArray(history) && history.length > 0) {
-    const recentHistory = history.slice(-10);
-    for (const msg of recentHistory) {
-      if (msg.text && (msg.role === 'user' || msg.role === 'model')) {
-        contents.push({
-          role: msg.role,
-          parts: [{ text: msg.text }]
-        });
-      }
-    }
+  function getStatus() {
+    const { apiKey } = readConfig();
+    return { apiKeyConfigured: configured(apiKey), aiStatus: configured(apiKey) ? state : 'not_configured' };
   }
 
-  // Append the current user prompt
-  contents.push({
-    role: 'user',
-    parts: [{ text: prompt }]
-  });
-
-  const requestBody = {
-    contents,
-    systemInstruction: {
-      parts: [{ text: CSIT_SYSTEM_INSTRUCTION }]
-    },
-    generationConfig: {
-      temperature: 0.7,
-      topK: 40,
-      topP: 0.95,
-      maxOutputTokens: 2048
+  async function getGeminiResponse(prompt, history = []) {
+    const { apiKey, model } = readConfig();
+    if (!configured(apiKey)) {
+      throw new ChatServiceError('API_KEY_MISSING', 503, 'The study assistant is being set up. Please check back soon.');
     }
-  };
+    if (blockedError) throw blockedError;
+    if (!aiClient) {
+      aiClient = new GoogleGenAI({ apiKey });
+    }
 
-  let lastError = null;
+    const contents = history.slice(-10).map(({ role, text }) => ({
+      role: role === 'assistant' ? 'model' : 'user',
+      parts: [{ text }]
+    }));
+    contents.push({ role: 'user', parts: [{ text: prompt }] });
 
-  for (const model of MODEL_LIST) {
-    try {
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
-      const response = await axios.post(url, requestBody, {
-        headers: { 'Content-Type': 'application/json' },
-        timeout: 30000 // 30-second timeout
-      });
+    const modelsToTry = [model, 'gemini-3.5-flash', 'gemini-3.6-flash', 'gemini-flash-latest'].filter((m, i, arr) => m && arr.indexOf(m) === i);
 
-      const replyText = response.data?.candidates?.[0]?.content?.parts?.[0]?.text;
-      if (replyText) {
-        return replyText;
-      }
-      return 'No response was generated by the AI model. Please try rephrasing your question.';
-    } catch (error) {
-      lastError = error;
-
-      // If model not found or deprecated, try the next model
-      if ((error.response?.status === 404 || error.response?.status === 400) && model !== MODEL_LIST[MODEL_LIST.length - 1]) {
-        console.warn(`Model ${model} returned ${error.response?.status}. Trying next available model...`);
-        continue;
-      }
-
-      // Format human-friendly error messages
-      if (error.response) {
-        const errorData = error.response.data?.error || {};
-        const message = errorData.message || error.response.statusText;
-        const code = error.response.status;
-
-        console.error(`Gemini API error [${code}]:`, message);
-
-        if (code === 403) {
-          if (message.includes('leaked')) {
-            throw new Error(
-              'Your Gemini API key was reported as leaked and revoked by Google. Please generate a fresh API key at https://aistudio.google.com/app/apikey and update your .env file.'
-            );
+    let lastError = null;
+    for (const currentModel of modelsToTry) {
+      try {
+        const response = await aiClient.models.generateContent({
+          model: currentModel,
+          contents,
+          config: {
+            systemInstruction: SYSTEM_INSTRUCTION,
+            maxOutputTokens: 4096,
           }
-          throw new Error(`API key permission denied or invalid: ${message}`);
+        });
+
+        const reply = response.text ? response.text.trim() : '';
+        if (!reply) {
+          throw new ChatServiceError('EMPTY_RESPONSE', 502, 'No answer came back. Please try rephrasing your question.', true);
         }
 
-        if (code === 429) {
-          throw new Error('Gemini API rate limit or quota exceeded. Please wait a few moments and try again.');
+        state = 'ready';
+        return reply;
+      } catch (error) {
+        lastError = error;
+        const safeError = error instanceof ChatServiceError ? error : classifyError(error);
+        if (['API_KEY_REVOKED', 'API_KEY_INVALID'].includes(safeError.code)) {
+          blockedError = safeError;
+          state = 'unavailable';
+          log.error(`${safeError.code}: Check GEMINI_API_KEY in server environment.`);
+          throw safeError;
         }
-
-        if (code === 404) {
-          throw new Error(`Gemini model "${model}" not found for API version v1beta: ${message}`);
-        }
-
-        throw new Error(`Gemini AI Service error (${code}): ${message}`);
-      } else if (error.code === 'ECONNABORTED') {
-        throw new Error('Request to Gemini API timed out after 30 seconds. Please try again.');
-      } else {
-        throw new Error(`Network error connecting to Gemini API: ${error.message}`);
+        // If it's a 404/503 for a specific model, try the next fallback model in the list
+        log.warn(`Model ${currentModel} failed (${safeError.code}). Trying fallback if available...`);
       }
     }
+
+    const safeError = classifyError(lastError);
+    state = safeError.code === 'MODEL_UNAVAILABLE' ? 'unavailable' : 'degraded';
+    log.warn(`All Gemini models failed: ${safeError.code}`);
+    throw safeError;
   }
 
-  throw lastError || new Error('Failed to communicate with Gemini API');
-};
+  return { getGeminiResponse, getStatus };
+}
 
-module.exports = {
-  getGeminiResponse,
-  DEFAULT_MODEL,
-  MODEL_LIST
-};
+module.exports = { ...createGeminiService(), createGeminiService, ChatServiceError };

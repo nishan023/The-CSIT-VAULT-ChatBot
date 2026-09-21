@@ -1,78 +1,47 @@
+require("./config");
 const express = require("express");
-const dotenv = require("dotenv");
+const path = require("node:path");
 const cors = require("cors");
 const chatbotRoutes = require("./routes/chatbotRoutes");
+const { logger, requestLogger } = require("./utils/logger");
 
-dotenv.config();
+const { getStatus } = require("./services/geminiService");
 const app = express();
+app.disable("x-powered-by");
 
 // Middlewares
 app.use(cors());
-app.use(express.json({ limit: "1mb" }));
+app.use(requestLogger);
+app.use(express.json({ limit: "384kb" }));
 
-// Root welcome & API info endpoint
-app.get("/", (req, res) => {
-  res.json({
-    service: "The CSIT Vault Chatbot API",
-    status: "running",
-    version: "1.0.0",
-    author: "Nishan Dhakal",
-    endpoints: {
-      health: "/health",
-      chatbotAsk: "POST /api/chatbot/ask"
-    },
-    documentation: "Send a POST request to /api/chatbot/ask with { prompt: 'your question' }"
-  });
-});
+// Routes
+app.use("/api/chatbot", chatbotRoutes);
 
 // Health check endpoint
 app.get("/health", (req, res) => {
-  const hasApiKey = Boolean(
-    process.env.GEMINI_API_KEY && 
-    !process.env.GEMINI_API_KEY.includes('your_') &&
-    process.env.GEMINI_API_KEY.trim() !== ''
-  );
-
-  res.json({ 
-    status: "OK", 
-    service: "The CSIT Vault Chatbot Backend",
-    apiKeyConfigured: hasApiKey,
-    model: process.env.GEMINI_MODEL || "gemini-1.5-flash",
-    timestamp: new Date().toISOString()
+  res.json({
+    status: "OK",
+    message: "Server is running",
+    ...getStatus(),
+    timestamp: new Date().toISOString(),
   });
 });
 
-// Chatbot routes
-app.use("/api/chatbot", chatbotRoutes);
+const PORT = process.env.PORT;
 
-// 404 handler
-app.use((req, res) => {
-  res.status(404).json({
-    error: "Route not found",
-    path: req.originalUrl,
-    availableEndpoints: ["GET /", "GET /health", "POST /api/chatbot/ask"]
-  });
+// Only the frontend directory is public; never expose the server or .env.
+app.use(express.static(path.join(__dirname, "../ChatBot-Frontend"), { dotfiles: "deny" }));
+app.get("/", (req, res) => res.json({ status: "OK", service: "The CSIT Vault Chatbot" }));
+app.use((error, req, res, next) => {
+  const status = error.type === "entity.too.large" ? 413 : error.type === "entity.parse.failed" ? 400 : 500;
+  res.status(status).json({ success: false, code: status === 500 ? "INTERNAL_ERROR" : "INVALID_BODY", error: status === 413 ? "This message is too large." : status === 400 ? "Send a valid JSON request." : "Something went wrong. Please try again.", retryable: false });
 });
-
-// Global error handler
-app.use((err, req, res, next) => {
-  console.error("Unhandled error:", err);
-  res.status(500).json({
-    error: "Internal server error",
-    message: err.message
-  });
-});
-
-const PORT = process.env.PORT || 5000;
 
 if (require.main === module) {
   app.listen(PORT, () => {
-    console.log(`\n==============================================`);
-    console.log(`🚀 The CSIT Vault Chatbot API`);
-    console.log(`🌐 Server running at: http://localhost:${PORT}`);
-    console.log(`📡 Health check:     http://localhost:${PORT}/health`);
-    console.log(`🤖 Chatbot API:      http://localhost:${PORT}/api/chatbot/ask`);
-    console.log(`==============================================\n`);
+    logger.info(`Server running on port ${PORT}`);
+    logger.info(`Health check: http://localhost:${PORT}/health`);
+    logger.info(`Chatbot API:  http://localhost:${PORT}/api/chatbot/ask`);
   });
 }
 
